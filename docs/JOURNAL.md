@@ -43,3 +43,31 @@ What looked like four different problems was actually a chain:
 Lesson: when telemetry looks broken, instrument from both ends —
 `tetra getevents` (source-side) and `SELECT count()` (sink-side) — before
 changing config. Saved hours once we did.
+
+## Day 3 — Agent loop live
+
+The gatekeeper agent is now end-to-end:
+- Pluggable LLM backend (Ollama implemented, Anthropic stubbed)
+- Multi-turn investigation loop with 3-query budget cap and loop detection
+- Three ClickHouse tools: query_recent_executions, query_pod_activity, 
+  query_binary_history
+- Structured output via Pydantic models (Finding | CleanRun)
+
+### What worked first try
+- Tool schema fired correctly with gemma4:e4b
+- ClickHouse queries via port-forward returned PrettyCompact tables
+- Pydantic parsing of model output
+
+### What needed iteration
+gemma4:e4b at 8B doesn't naturally converge — it kept calling the same tool
+with slightly different parameters indefinitely. Fixed with two prompt-engineering
+patterns:
+1. Explicit tool-call budget in the initial user message ("You have 3 calls")
+2. Loop detection in the agent code — same-tool-twice triggers a forced-conclusion
+   user message
+
+### Open observations
+- Initial cycle returned a CleanRun, which is correct (the cluster IS clean)
+- Need a red-team workload (day 4) to validate the agent CAN detect actual badness
+- Pod metadata enrichment limitation from day 2 still applies — agent sees
+  namespace="host" for short-lived processes
