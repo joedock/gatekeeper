@@ -1,0 +1,81 @@
+role: Agent
+
+service:
+  enabled: false
+
+# Tolerate any taints so Vector runs on every node, including control-plane.
+tolerations:
+  - operator: Exists
+
+customConfig:
+  data_dir: /vector-data-dir
+
+  api:
+    enabled: false
+
+  sources:
+    tetragon_logs:
+      type: kubernetes_logs
+      extra_label_selector: "app.kubernetes.io/name=tetragon"
+      # Only read the export-stdout container — that's where the JSON events come from.
+      extra_field_selector: ""
+
+  transforms:
+    parse_tetragon:
+      type: remap
+      inputs:
+        - tetragon_logs
+      source: |
+        # Parse the Tetragon JSON line. If it's not valid JSON, drop it.
+        parsed, err = parse_json(.message)
+        if err != null { abort }
+
+        # We only care about process_exec events. Drop everything else (process_exit, etc).
+        if parsed.process_exec == null { abort }
+
+        # Build a clean output object — the "Clean Room" pattern.
+        # Only fields explicitly added here will reach ClickHouse.
+        clean = {}
+
+        # Timestamp: Tetragon emits RFC3339; ClickHouse DateTime64(3) wants
+        # 'YYYY-MM-DD HH:MM:SS.fff'. Reformat explicitly.
+        time_str = to_string(parsed.time) ?? ""
+        ts = parse_timestamp(time_str, "%+") ?? now()
+        clean.timestamp = format_timestamp!(ts, "%Y-%m-%d %H:%M:%S.%3f")
+
+        clean.node_name      = parsed.node_name                              || "unknown-node"
+        clean.namespace      = parsed.process_exec.process.pod.namespace     || "host"
+        clean.pod_name       = parsed.process_exec.process.pod.name          || "host"
+        clean.process_binary = parsed.process_exec.process.binary            || "unknown"
+        clean.parent_process = parsed.process_exec.parent.binary             || "unknown"
+
+        # Arguments: Tetragon delivers as a single space-joined string.
+        # Split into an Array(String) to match the ClickHouse schema.
+        args = to_string(parsed.process_exec.process.arguments) ?? ""
+        clean.process_arguments = if args == "" { [] } else { split(args, " ") }
+
+        . = clean
+
+  sinks:
+    clickhouse_out:
+      type: clickhouse
+      inputs:
+        - parse_tetragon
+      endpoint: "http://clickhouse-service.telemetry.svc.cluster.local:8123"
+      database: "default"
+      table: "process_telemetry"
+      skip_unknown_fields: true
+      compression: gzip
+      batch:
+        max_events: 1000
+        timeout_secs: 5
+      healthcheck:
+        enabled: true
+
+    # Console sink for debugging. Comment out once pipeline is stable.
+    debug_out:
+      type: console
+      inputs:
+        - parse_tetragon
+      encoding:
+        codec: json
